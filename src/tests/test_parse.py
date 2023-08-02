@@ -9,6 +9,8 @@ from sql.parse import (
     parse,
     without_sql_comment,
     magic_args,
+    escape_string_literals_with_colon_prefix,
+    find_named_parameters,
 )
 
 try:
@@ -78,13 +80,51 @@ def test_parse_shovel_operator():
     }
 
 
-def test_parse_return_shovel_operator():
-    assert parse("dest= << SELECT * FROM work", empty_config) == {
+@pytest.mark.parametrize(
+    "input_string",
+    [
+        "dest= << SELECT * FROM work",
+        "dest = << SELECT * FROM work",
+        "dest =<< SELECT * FROM work",
+        "dest =        << SELECT * FROM work",
+        "dest      =<< SELECT * FROM work",
+        "dest =          << SELECT * FROM work",
+        "dest=<< SELECT * FROM work",
+        "dest=<<SELECT * FROM work",
+        "dest    =<<SELECT * FROM work",
+        "dest    =<<    SELECT * FROM work",
+        "dest=   <<    SELECT * FROM work",
+    ],
+)
+def test_parse_return_shovel_operator_with_equal(input_string, ip):
+    result_var = {
         "connection": "",
         "sql": "SELECT * FROM work",
         "result_var": "dest",
         "return_result_var": True,
     }
+    assert parse(input_string, empty_config) == result_var
+
+
+@pytest.mark.parametrize(
+    "input_string",
+    [
+        "dest<< SELECT * FROM work",
+        "dest<<SELECT * FROM work",
+        "dest    <<SELECT * FROM work",
+        "dest    <<    SELECT * FROM work",
+        "dest <<SELECT * FROM work",
+        "dest << SELECT * FROM work",
+    ],
+)
+def test_parse_return_shovel_operator_without_equal(input_string, ip):
+    result_var = {
+        "connection": "",
+        "sql": "SELECT * FROM work",
+        "result_var": "dest",
+        "return_result_var": False,
+    }
+    assert parse(input_string, empty_config) == result_var
 
 
 def test_parse_connect_plus_shovel():
@@ -108,7 +148,7 @@ def test_parse_early_newlines():
 def test_parse_connect_shovel_over_newlines():
     assert parse("\nsqlite://\ndest\n<<\nSELECT *\nFROM work", empty_config) == {
         "connection": "sqlite://",
-        "sql": "SELECT *\nFROM work",
+        "sql": "\nSELECT *\nFROM work",
         "result_var": "dest",
         "return_result_var": False,
     }
@@ -240,3 +280,65 @@ def test_magic_args(ip, line, expected):
     args = magic_args(sql_line, line)
 
     assert args.__dict__ == complete_with_defaults(expected)
+
+
+@pytest.mark.parametrize(
+    "query, expected_escaped, expected_found",
+    [
+        ("SELECT * FROM table where x > :x", "SELECT * FROM table where x > :x", []),
+        (
+            "SELECT * FROM table where x > ':x'",
+            "SELECT * FROM table where x > '\\:x'",
+            ["x"],
+        ),
+        (
+            'SELECT * FROM table where x > ":y"',
+            'SELECT * FROM table where x > "\\:y"',
+            ["y"],
+        ),
+        (
+            "SELECT * FROM table where x > '':something''",
+            "SELECT * FROM table where x > ''\\:something''",
+            ["something"],
+        ),
+        (
+            'SELECT * FROM table where x > "":var""',
+            'SELECT * FROM table where x > ""\\:var""',
+            ["var"],
+        ),
+    ],
+    ids=[
+        "no-escape",
+        "single-quote",
+        "double-quote",
+        "double-single-quote",
+        "double-double-quote",
+    ],
+)
+def test_escape_string_literals_with_colon_prefix(
+    query, expected_escaped, expected_found
+):
+    escaped, found = escape_string_literals_with_colon_prefix(query)
+    assert escaped == expected_escaped
+    assert found == expected_found
+
+
+@pytest.mark.parametrize(
+    "query, expected",
+    [
+        (
+            "SELECT * FROM penguins WHERE species = :species AND mass = ':mass'",
+            ["species"],
+        ),
+        (
+            'SELECT * FROM penguins WHERE species = :species AND mass = ":mass"',
+            ["species"],
+        ),
+        (
+            "SELECT * FROM penguins WHERE species = :species AND mass = :mass",
+            ["species", "mass"],
+        ),
+    ],
+)
+def test_find_named_parameters(query, expected):
+    assert find_named_parameters(query) == expected

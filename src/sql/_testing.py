@@ -1,14 +1,41 @@
-from dockerctx import new_container
+import os
 from contextlib import contextmanager
 import sys
 import time
-import docker
-from docker import errors
+
 from sqlalchemy.engine import URL
-import os
 import sqlalchemy
+from IPython.core.interactiveshell import InteractiveShell
+
+from ploomber_core.dependencies import requires
+
+# SQLite and DuckDB do not require Docker, so we make docker packages optional
+# in case we want to run those tests
+
+try:
+    from dockerctx import new_container
+except ModuleNotFoundError:
+    new_container = None
+
+try:
+    import docker
+except ModuleNotFoundError:
+    docker = None
+
 
 TMP_DIR = "tmp"
+
+
+class TestingShell(InteractiveShell):
+    """
+    A custom InteractiveShell that raises exceptions instead of silently suppressing
+    them.
+    """
+
+    def run_cell(self, *args, **kwargs):
+        result = super().run_cell(*args, **kwargs)
+        result.raise_error()
+        return result
 
 
 class DatabaseConfigHelper:
@@ -24,6 +51,28 @@ class DatabaseConfigHelper:
     def get_tmp_dir():
         return TMP_DIR
 
+
+mssql_base = {
+    "username": "sa",
+    "password": "Ploomber_App@Root_Password",
+    "database": "master",
+    "host": "localhost",
+    "port": "1433",
+    "query": {
+        "driver": "ODBC Driver 18 for SQL Server",
+        "Encrypt": "yes",
+        "TrustServerCertificate": "yes",
+    },
+    "docker_ct": {
+        "name": "MSSQL",
+        "image": "mcr.microsoft.com/azure-sql-edge",
+        "ports": {1433: 1433},
+    },
+    "alias": "MSSQLTest",
+}
+
+mssql_pyobdc = {**mssql_base, "drivername": "mssql+pyodbc"}
+mssql_pytds = {**mssql_base, "drivername": "mssql+pytds"}
 
 databaseConfig = {
     "postgreSQL": {
@@ -68,7 +117,7 @@ databaseConfig = {
         "alias": "mariaDBTest",
         "docker_ct": {
             "name": "mariadb",
-            "image": "mariadb",
+            "image": "mariadb:10.4.30",
             "ports": {3306: 33309},
         },
         "query": {},
@@ -93,31 +142,14 @@ databaseConfig = {
         "alias": "duckDBTest",
         "query": {},
     },
-    "MSSQL": {
-        "drivername": "mssql+pyodbc",
-        "username": "sa",
-        "password": "Ploomber_App@Root_Password",
-        "database": "master",
-        "host": "localhost",
-        "port": "1433",
-        "query": {
-            "driver": "ODBC Driver 18 for SQL Server",
-            "Encrypt": "yes",
-            "TrustServerCertificate": "yes",
-        },
-        "docker_ct": {
-            "name": "MSSQL",
-            "image": "mcr.microsoft.com/azure-sql-edge",
-            "ports": {1433: 1433},
-        },
-        "alias": "MSSQLTest",
-    },
+    "MSSQL": mssql_pyobdc,
+    "mssql_pytds": mssql_pytds,
     "Snowflake": {
         "drivername": "snowflake",
         "username": os.getenv("SF_USERNAME"),
         "password": os.getenv("SF_PASSWORD"),
         # database/schema
-        "database": os.getenv("SF_DATABASE"),
+        "database": os.getenv("SF_DATABASE", "JUPYSQL_INTEGRATION_TESTING/GENERAL"),
         "host": "lpb17716.us-east-1",
         "port": None,
         "alias": "snowflakeTest",
@@ -162,9 +194,6 @@ def _get_database_url(database):
     ).render_as_string(hide_password=False)
 
 
-client = docker.from_env()
-
-
 def database_ready(
     database,
     timeout=60,
@@ -187,6 +216,8 @@ def database_ready(
             eng.close()
             print(f"{database} is initialized successfully")
             return True
+        except ModuleNotFoundError:
+            raise
         except Exception as e:
             print(type(e))
             errors.append(str(e))
@@ -208,6 +239,7 @@ def get_docker_client():
 
 
 @contextmanager
+@requires(["docker", "dockerctx"])
 def postgres(is_bypass_init=False):
     if is_bypass_init:
         yield None
@@ -217,7 +249,7 @@ def postgres(is_bypass_init=False):
         client = get_docker_client()
         container = client.containers.get(db_config["docker_ct"]["name"])
         yield container
-    except errors.NotFound:
+    except docker.errors.NotFound:
         print("Creating new container: postgreSQL")
         with new_container(
             new_container_name=db_config["docker_ct"]["name"],
@@ -240,6 +272,7 @@ def postgres(is_bypass_init=False):
 
 
 @contextmanager
+@requires(["docker", "dockerctx"])
 def mysql(is_bypass_init=False):
     if is_bypass_init:
         yield None
@@ -249,7 +282,7 @@ def mysql(is_bypass_init=False):
         client = get_docker_client()
         container = client.containers.get(db_config["docker_ct"]["name"])
         yield container
-    except errors.NotFound:
+    except docker.errors.NotFound:
         print("Creating new container: mysql")
         with new_container(
             new_container_name=db_config["docker_ct"]["name"],
@@ -280,6 +313,7 @@ def mysql(is_bypass_init=False):
 
 
 @contextmanager
+@requires(["docker", "dockerctx"])
 def mariadb(is_bypass_init=False):
     if is_bypass_init:
         yield None
@@ -289,7 +323,7 @@ def mariadb(is_bypass_init=False):
         client = get_docker_client()
         curr = client.containers.get(db_config["docker_ct"]["name"])
         yield curr
-    except errors.NotFound:
+    except docker.errors.NotFound:
         print("Creating new container: mariaDB")
         with new_container(
             new_container_name=db_config["docker_ct"]["name"],
@@ -320,6 +354,7 @@ def mariadb(is_bypass_init=False):
 
 
 @contextmanager
+@requires(["docker", "dockerctx"])
 def mssql(is_bypass_init=False):
     if is_bypass_init:
         yield None
@@ -329,7 +364,7 @@ def mssql(is_bypass_init=False):
         client = get_docker_client()
         curr = client.containers.get(db_config["docker_ct"]["name"])
         yield curr
-    except errors.NotFound:
+    except docker.errors.NotFound:
         print("Creating new container: MSSQL")
         with new_container(
             new_container_name=db_config["docker_ct"]["name"],
@@ -353,6 +388,7 @@ def mssql(is_bypass_init=False):
 
 
 @contextmanager
+@requires(["docker", "dockerctx"])
 def oracle(is_bypass_init=False):
     if is_bypass_init:
         yield None
@@ -362,7 +398,7 @@ def oracle(is_bypass_init=False):
         client = get_docker_client()
         curr = client.containers.get(db_config["docker_ct"]["name"])
         yield curr
-    except errors.NotFound:
+    except docker.errors.NotFound:
         print("Creating new container: oracle")
         with new_container(
             new_container_name=db_config["docker_ct"]["name"],
@@ -381,7 +417,7 @@ def oracle(is_bypass_init=False):
 
 def main():
     print("Starting test containers...")
-    with oracle():
+    with postgres(), mysql(), mariadb(), mssql(), oracle():
         print("Press CTRL+C to exit")
         try:
             while True:

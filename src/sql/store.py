@@ -43,8 +43,6 @@ class SQLStore(MutableMapping):
         self._data[key] = value
 
     def __getitem__(self, key) -> str:
-        if not self._data:
-            raise exceptions.UsageError("No saved SQL")
         if key not in self._data:
             matches = difflib.get_close_matches(key, self._data)
             error = f'"{key}" is not a valid snippet identifier.'
@@ -125,11 +123,16 @@ class SQLQuery:
             """WITH{% for name in with_ %} `{{name}}` AS ({{rts(saved[name]._query)}})\
 {{ "," if not loop.last }}{% endfor %}{{query}}"""
         )
-        is_use_backtick = sql.connection.Connection.current.is_use_backtick_template()
+        is_use_backtick = (
+            sql.connection.ConnectionManager.current.is_use_backtick_template()
+        )
         with_all = _get_dependencies(self._store, self._with_)
         template = (
             with_clause_template_backtick if is_use_backtick else with_clause_template
         )
+        # return query without 'with' when no dependency exists
+        if len(with_all) == 0:
+            return self._query.strip()
         return template.render(
             query=self._query,
             saved=self._store._data,

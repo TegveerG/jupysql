@@ -5,7 +5,7 @@ jupytext:
     extension: .md
     format_name: myst
     format_version: 0.13
-    jupytext_version: 1.14.5
+    jupytext_version: 1.14.7
 kernelspec:
   display_name: Python 3 (ipykernel)
   language: python
@@ -50,6 +50,10 @@ if not Path("penguins.csv").is_file():
 ```{code-cell} ipython3
 %%sql
 SELECT * FROM "penguins.csv" LIMIT 3
+```
+
+```{note}
+You can view the documentation and command line arguments by running `%sqlplot?`
 ```
 
 ## `%sqlplot boxplot`
@@ -135,6 +139,12 @@ generate histograms without explicitly removing NULL entries.
 %sqlplot histogram --table penguins.csv --column body_mass_g 
 ```
 
+When plotting a histogram, it divides a range with the number of bins - 1 to calculate a bin size. Then, it applies round half down relative to the bin size and categorizes continuous values into bins to replicate right closed intervals from the ggplot histogram in R.
+
+![body_mass_g](../static/body_mass_g_R.png)
+
++++
+
 ### Number of bins
 
 ```{code-cell} ipython3
@@ -152,10 +162,11 @@ generate histograms without explicitly removing NULL entries.
 `%sqlplot` returns a `matplotlib.Axes` object.
 
 ```{code-cell} ipython3
-ax = %sqlplot histogram --table penguins.csv --column body_mass_g 
+ax = %sqlplot histogram --table penguins.csv --column body_mass_g
 ax.set_title("Body mass (grams)")
 _ = ax.grid()
 ```
+
 ## `%sqlplot bar`
 
 ```{versionadded} 0.7.6
@@ -196,7 +207,7 @@ You can also pass the orientation using the `orient` argument.
 
 ```{code-cell} ipython3
 %sqlplot bar --table add_col --column species cnt --with add_col --orient h
-``` 
+```
 
 You can also show the number on top of the bar using the `S`/`show-numbers` argument.
 
@@ -237,6 +248,7 @@ group by species
 ```{code-cell} ipython3
 %sqlplot pie --table add_col --column species cnt --with add_col
 ```
+
 Here, `species` is the `labels` column and `cnt` is the `x` column.
 
 

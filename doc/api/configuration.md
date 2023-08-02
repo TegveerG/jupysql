@@ -1,13 +1,13 @@
 ---
 jupytext:
-  notebook_metadata_filter: myst
   cell_metadata_filter: -all
   formats: md:myst
+  notebook_metadata_filter: myst
   text_representation:
     extension: .md
     format_name: myst
     format_version: 0.13
-    jupytext_version: 1.14.4
+    jupytext_version: 1.14.7
 kernelspec:
   display_name: Python 3 (ipykernel)
   language: python
@@ -208,9 +208,9 @@ Print number of rows affected by DML.
 
 ```{code-cell} ipython3
 %%sql
-CREATE TABLE points (x, y);
-INSERT INTO points VALUES (0, 0);
-INSERT INTO points VALUES (1, 1);
+CREATE TABLE my_points (x, y);
+INSERT INTO my_points VALUES (0, 0);
+INSERT INTO my_points VALUES (1, 1);
 ```
 
 ```{code-cell} ipython3
@@ -222,4 +222,56 @@ INSERT INTO points VALUES (1, 1);
 CREATE TABLE more_points (x, y);
 INSERT INTO more_points VALUES (0, 0);
 INSERT INTO more_points VALUES (1, 1);
+```
+
+## `style`
+
+DEFAULT: `DEFAULT`
+
+Set the table printing style to any of prettytable's defined styles
+
+```{code-cell} ipython3
+%config SqlMagic.style = "MSWORD_FRIENDLY"
+res = %sql SELECT * FROM languages LIMIT 2
+print(res)
+```
+
+```{code-cell} ipython3
+%config SqlMagic.style = "SINGLE_BORDER"
+res = %sql SELECT * FROM languages LIMIT 2
+print(res)
+```
+
+## `named_parameters`
+
+Default: `False`
+
+If True, it enables named parameters `:variable`. Learn more in the [tutorial.](../user-guide/template.md)
+
+```{code-cell} ipython3
+%config SqlMagic.named_parameters=True
+```
+
+```{code-cell} ipython3
+rating = 12
+```
+
+```{code-cell} ipython3
+%%sql
+SELECT *
+FROM languages
+WHERE rating > :rating
+```
+
+## Loading configuration from a `pyproject.toml` file
+
+```{versionadded} 0.9
+```
+
+You can define configurations in a `pyproject.toml` file and automatically load the configurations when you run `%load_ext sql`. If the file is not found in the current or parent directories, default values will be used. A sample `pyproject.toml` could look like this:
+
+```
+[tool.jupysql.SqlMagic]
+feedback = true
+autopandas = true
 ```

@@ -1,21 +1,62 @@
 # CHANGELOG
 
-## 0.7.9dev
+## 0.9.1dev
+* [Fix] Fix boxplot for duckdb native ([#728](https://github.com/ploomber/jupysql/issues/728))
 
-* [Fix] Added bottom-padding to the buttons in table explorer. Now they are not hidden by the scrollbar (#540)
-* [Feature] Modified `histogram` command to support data with NULL values (#176)
+## 0.9.0 (2023-08-01)
+
+* [Feature] Allow loading configuration value from a `pyproject.toml` file upon magic initialization ([#689](https://github.com/ploomber/jupysql/issues/689))
+* [Feature] Adds `with_` to `{SQLAlchemyConnection, DBAPIConnection}.raw_execute` to resolve CTEs
+* [Feature] allows parametrizing queries with `:variable` with `%config SqlMagic.named_parameters = True`
+* [Fix] Fix error that was incorrectly converted into a print message
+* [Fix] Modified histogram query to ensure histogram binning is done correctly ([#751](https://github.com/ploomber/jupysql/issues/751))
+* [Fix] Fix bug that caused the `COMMIT` not to work when the SQLAlchemy driver did not support `set_isolation_level`
+* [Fix] Fixed vertical color breaks in histograms ([#702](https://github.com/ploomber/jupysql/issues/702))
+* [Fix] Showing feedback when switching connections ([#727](https://github.com/ploomber/jupysql/issues/727))
+* [Fix] Fix error that caused some connections not to be closed when calling `--close/-x`
+* [Fix] Fix bug that caused the query transpilation process to fail when passing multiple statements
+* [Fix] Fixes error when creating tables and querying them in the same cell when using DuckDB + SQLAlchemy ([#674](https://github.com/ploomber/jupysql/issues/674))
+* [Fix] Using native methods to convert to data frames from DuckDB when using native connections and SQLAlchemy
+* [Fix] Fix error that caused literals like `':something'` to be interpreted as query parameters
+
+## 0.8.0 (2023-07-18)
+
+* [Feature] Modified `TableDescription` to add styling, generate messages and format the calculated outputs ([#459](https://github.com/ploomber/jupysql/issues/459))
+* [Feature] Support flexible spacing `myvar=<<` operator ([#525](https://github.com/ploomber/jupysql/issues/525))
+* [Feature] Added a line under `ResultSet` to distinguish it from data frame and error message when invalid operations are performed ([#468](https://github.com/ploomber/jupysql/issues/468))
+* [Feature] Moved `%sqlrender` feature to `%sqlcmd snippets` ([#647](https://github.com/ploomber/jupysql/issues/647))
+* [Feature] Added tables listing stored snippets when `%sqlcmd snippets` is called ([#648](https://github.com/ploomber/jupysql/issues/648))
+* [Feature] Better performance when using DuckDB native connection and converting to `pandas.DataFrame` or `polars.DataFrame`
+* [Fix] Fixed CI issue by updating `invalid_connection_string_duckdb` in `test_magic.py` ([#631](https://github.com/ploomber/jupysql/issues/631))
+* [Fix] Refactored `ResultSet` to lazy loading ([#470](https://github.com/ploomber/jupysql/issues/470))
+* [Fix] Removed `WITH` when a snippet does not have a dependency ([#657](https://github.com/ploomber/jupysql/issues/657))
+* [Fix] Used display module when generating CTE ([#649](https://github.com/ploomber/jupysql/issues/649))
+* [Fix] Adding `--with` back because of issues with sqlglot query parser ([#684](https://github.com/ploomber/jupysql/issues/684))
+* [Fix] Improving `<<` parsing logic ([#610](https://github.com/ploomber/jupysql/issues/610))
+* [Fix] Migrate user feedback to use display module ([#548](https://github.com/ploomber/jupysql/issues/548))
+* [Doc] Modified integrations content to ensure they're all consistent ([#523](https://github.com/ploomber/jupysql/issues/523))
+* [Doc] Document `--persist-replace` in API section ([#539](https://github.com/ploomber/jupysql/issues/539))
+* [Doc] Re-organized sections. Adds section showing how to share notebooks via Ploomber Cloud
+
+## 0.7.9 (2023-06-19)
+
+* [Feature] Modified `histogram` command to support data with NULL values ([#176](https://github.com/ploomber/jupysql/issues/176))
+* [Feature] Automated dependency inference when creating CTEs. `--with` is now deprecated and will display a warning. ([#166](https://github.com/ploomber/jupysql/issues/166))
+* [Feature] Close all connections when Python shuts down ([#563](https://github.com/ploomber/jupysql/issues/563))
+* [Fix] Fixed `ResultSet` class to display result table with proper style and added relevant example ([#54](https://github.com/ploomber/jupysql/issues/54))
+* [Fix] Fixed `Set` method in `Connection` class to recognize same descriptor with different aliases  ([#532](https://github.com/ploomber/jupysql/issues/532))
+* [Fix] Added bottom-padding to the buttons in table explorer. Now they are not hidden by the scrollbar ([#540](https://github.com/ploomber/jupysql/issues/540))
 * [Fix] `psutil` is no longer a dependency for JupySQL ([#541](https://github.com/ploomber/jupysql/issues/541))
-* [Feature] Automated dependency inference when creating CTEs. `--with` is now deprecated and will display a warning. (#166)
-* [Feature] Close all connections when Python shuts down (#563)
-* [Doc] Added bar and pie examples in the plotting section (#564)
-* [Doc] Added more details to the SQL parametrization user guide. (#288)
-* [Doc] Snowflake integration guide (#384)
-* [Doc] User guide on using JupySQL in `.py` scripts (#449)
-* [Fix] Validating arguments passed to `%%sql` (#561)
+* [Fix] Validating arguments passed to `%%sql` ([#561](https://github.com/ploomber/jupysql/issues/561))
+* [Doc] Added bar and pie examples in the plotting section ([#564](https://github.com/ploomber/jupysql/issues/564))
+* [Doc] Added more details to the SQL parametrization user guide. ([#288](https://github.com/ploomber/jupysql/issues/288))
+* [Doc] Snowflake integration guide ([#384](https://github.com/ploomber/jupysql/issues/384))
+* [Doc] User guide on using JupySQL in `.py` scripts ([#449](https://github.com/ploomber/jupysql/issues/449))
+* [Doc] Added `%magic?` to APIs and quickstart ([#97](https://github.com/ploomber/jupysql/issues/97))
 
 ## 0.7.8 (2023-06-01)
 
-* [Feature] Add `%sqlplot bar` and `%sqlplot pie` (#508)
+* [Feature] Add `%sqlplot bar` and `%sqlplot pie` ([#508](https://github.com/ploomber/jupysql/issues/508))
 
 ## 0.7.7 (2023-05-31)
 

@@ -1,23 +1,23 @@
 from sqlalchemy import inspect
 from prettytable import PrettyTable
 from ploomber_core.exceptions import modify_exceptions
-from sql.connection import Connection
+from sql.connection import ConnectionManager
 from sql.telemetry import telemetry
 from sql import exceptions
-import sql.run
 import math
 from sql import util
 from IPython.core.display import HTML
+import uuid
 
 
 def _get_inspector(conn):
     if conn:
         return inspect(conn)
 
-    if not Connection.current:
+    if not ConnectionManager.current:
         raise exceptions.RuntimeError("No active connection")
     else:
-        return inspect(Connection.current.session)
+        return inspect(ConnectionManager.current.connection_sqlalchemy)
 
 
 class DatabaseInspection:
@@ -77,6 +77,94 @@ def _get_row_with_most_keys(rows):
     return list(rows[max_idx])
 
 
+def _is_numeric(value):
+    """Check if a column has numeric and not categorical datatype"""
+    try:
+        if isinstance(value, bool):
+            return False
+        float(value)  # Try to convert the value to float
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_numeric_as_str(column, value):
+    """Check if a column contains numerical data stored as `str`"""
+    try:
+        if isinstance(value, str) and _is_numeric(value):
+            return True
+        return False
+    except ValueError:
+        pass
+
+
+def _generate_column_styles(
+    column_indices, unique_id, background_color="#FFFFCC", text_color="black"
+):
+    """
+    Generate CSS styles to change the background-color of all columns
+    with data-type mismatch.
+
+    Parameters
+    ----------
+        column_indices (list): List of column indices with data-type mismatch.
+        unique_id (str): Unique ID for the current table.
+        background_color (str, optional): Background color for the mismatched columns.
+        text_color (str, optional): Text color for the mismatched columns.
+
+    Returns:
+        str: HTML style tags containing the CSS styles for the mismatched columns.
+    """
+
+    styles = ""
+    for index in column_indices:
+        styles = f"""{styles}
+        #profile-table-{unique_id} td:nth-child({index + 1}) {{
+            background-color: {background_color};
+            color: {text_color};
+        }}
+        """
+    return f"<style>{styles}</style>"
+
+
+def _generate_message(column_indices, columns):
+    """Generate a message indicating all columns with a datatype mismatch"""
+    message = "Columns "
+    for c in column_indices:
+        col = columns[c - 1]
+        message = f"{message}<code>{col}</code>"
+    message = (
+        f"{message} have a datatype mismatch -> numeric values stored as a string."
+    )
+    message = f"{message} <br> Cannot calculate mean/min/max/std/percentiles"
+    return message
+
+
+def _assign_column_specific_stats(col_stats, is_numeric):
+    """
+    Assign NaN values to categorical/numerical specific statistic.
+
+    Parameters
+    ----------
+        col_stats (dict): Dictionary containing column statistics.
+        is_numeric (bool): Flag indicating whether the column is numeric or not.
+
+    Returns:
+        dict: Updated col_stats dictionary.
+    """
+    categorical_stats = ["top", "freq"]
+    numerical_stats = ["mean", "min", "max", "std", "25%", "50%", "75%"]
+
+    if is_numeric:
+        for stat in categorical_stats:
+            col_stats[stat] = math.nan
+    else:
+        for stat in numerical_stats:
+            col_stats[stat] = math.nan
+
+    return col_stats
+
+
 @modify_exceptions
 class Columns(DatabaseInspection):
     """
@@ -108,27 +196,36 @@ class Columns(DatabaseInspection):
 @modify_exceptions
 class TableDescription(DatabaseInspection):
     """
-    Generates descriptive statistics.
+     Generates descriptive statistics.
 
-    Descriptive statistics are:
+     --------------------------------------
+     Descriptive statistics are:
 
-    Count - Number of all not None values
+     Count - Number of all not None values
 
-    Mean - Mean of the values
+     Mean - Mean of the values
 
-    Max - Maximum of the values in the object.
+     Max - Maximum of the values in the object.
 
-    Min - Minimum of the values in the object.
+     Min - Minimum of the values in the object.
 
-    STD - Standard deviation of the observations
+     STD - Standard deviation of the observations
 
-    25h, 50h and 75h percentiles
+     25h, 50h and 75h percentiles
 
-    Unique - Number of not None unique values
+     Unique - Number of not None unique values
 
-    Top - The most frequent value
+     Top - The most frequent value
 
-    Freq - Frequency of the top value
+     Freq - Frequency of the top value
+
+    ------------------------------------------
+    Following statistics will be calculated for :-
+
+    Categorical columns - [Count, Unique, Top, Freq]
+
+    Numerical columns - [Count, Unique, Mean, Max, Min,
+                         STD, 25h, 50h and 75h percentiles]
 
     """
 
@@ -138,25 +235,41 @@ class TableDescription(DatabaseInspection):
         if schema:
             table_name = f"{schema}.{table_name}"
 
-        columns_query_result = sql.run.raw_run(
-            Connection.current, f"SELECT * FROM {table_name} WHERE 1=0"
-        )
+        conn = ConnectionManager.current
 
-        if Connection.is_custom_connection():
+        columns_query_result = conn.raw_execute(f"SELECT * FROM {table_name} WHERE 1=0")
+        if ConnectionManager.current.is_dbapi_connection:
             columns = [i[0] for i in columns_query_result.description]
         else:
             columns = columns_query_result.keys()
 
         table_stats = dict({})
         columns_to_include_in_report = set()
+        columns_with_styles = []
+        message_check = False
 
-        for column in columns:
+        for i, column in enumerate(columns):
             table_stats[column] = dict()
 
+            # check the datatype of a column
+            try:
+                result = ConnectionManager.current.raw_execute(
+                    f"""SELECT {column} FROM {table_name} LIMIT 1"""
+                ).fetchone()
+
+                value = result[0]
+                is_numeric = isinstance(value, (int, float)) or (
+                    isinstance(value, str) and _is_numeric(value)
+                )
+            except ValueError:
+                is_numeric = True
+
+            if _is_numeric_as_str(column, value):
+                columns_with_styles.append(i + 1)
+                message_check = True
             # Note: index is reserved word in sqlite
             try:
-                result_col_freq_values = sql.run.raw_run(
-                    Connection.current,
+                result_col_freq_values = ConnectionManager.current.raw_execute(
                     f"""SELECT DISTINCT {column} as top,
                     COUNT({column}) as frequency FROM {table_name}
                     GROUP BY top ORDER BY frequency Desc""",
@@ -172,8 +285,7 @@ class TableDescription(DatabaseInspection):
 
             try:
                 # get all non None values, min, max and avg.
-                result_value_values = sql.run.raw_run(
-                    Connection.current,
+                result_value_values = ConnectionManager.current.raw_execute(
                     f"""
                     SELECT MIN({column}) AS min,
                     MAX({column}) AS max,
@@ -183,9 +295,11 @@ class TableDescription(DatabaseInspection):
                     """,
                 ).fetchall()
 
-                table_stats[column]["min"] = result_value_values[0][0]
-                table_stats[column]["max"] = result_value_values[0][1]
+                columns_to_include_in_report.update(["count", "min", "max"])
                 table_stats[column]["count"] = result_value_values[0][2]
+
+                table_stats[column]["min"] = round(result_value_values[0][0], 4)
+                table_stats[column]["max"] = round(result_value_values[0][1], 4)
 
                 columns_to_include_in_report.update(["count", "min", "max"])
 
@@ -194,8 +308,7 @@ class TableDescription(DatabaseInspection):
 
             try:
                 # get unique values
-                result_value_values = sql.run.raw_run(
-                    Connection.current,
+                result_value_values = ConnectionManager.current.raw_execute(
                     f"""
                     SELECT
                     COUNT(DISTINCT {column}) AS unique_count
@@ -204,15 +317,12 @@ class TableDescription(DatabaseInspection):
                     """,
                 ).fetchall()
                 table_stats[column]["unique"] = result_value_values[0][0]
-
                 columns_to_include_in_report.update(["unique"])
-
             except Exception:
                 pass
 
             try:
-                results_avg = sql.run.raw_run(
-                    Connection.current,
+                results_avg = ConnectionManager.current.raw_execute(
                     f"""
                                 SELECT AVG({column}) AS avg
                                 FROM {table_name}
@@ -220,8 +330,8 @@ class TableDescription(DatabaseInspection):
                                 """,
                 ).fetchall()
 
-                table_stats[column]["mean"] = float(results_avg[0][0])
                 columns_to_include_in_report.update(["mean"])
+                table_stats[column]["mean"] = format(float(results_avg[0][0]), ".4f")
 
             except Exception:
                 table_stats[column]["mean"] = math.nan
@@ -231,8 +341,7 @@ class TableDescription(DatabaseInspection):
 
             try:
                 # Note: stddev_pop and PERCENTILE_DISC will work only on DuckDB
-                result = sql.run.raw_run(
-                    Connection.current,
+                result = ConnectionManager.current.raw_execute(
                     f"""
                     SELECT
                         stddev_pop({column}) as key_std,
@@ -246,11 +355,10 @@ class TableDescription(DatabaseInspection):
                     """,
                 ).fetchall()
 
+                columns_to_include_in_report.update(special_numeric_keys)
                 for i, key in enumerate(special_numeric_keys):
                     # r_key = f'key_{key.replace("%", "")}'
-                    table_stats[column][key] = float(result[0][i])
-
-                columns_to_include_in_report.update(special_numeric_keys)
+                    table_stats[column][key] = format(float(result[0][i]), ".4f")
 
             except TypeError:
                 # for non numeric values
@@ -268,22 +376,73 @@ class TableDescription(DatabaseInspection):
                 # We ignore the cell stats for such case.
                 pass
 
+            table_stats[column] = _assign_column_specific_stats(
+                table_stats[column], is_numeric
+            )
+
         self._table = PrettyTable()
         self._table.field_names = [" "] + list(table_stats.keys())
 
-        rows = list(columns_to_include_in_report)
-        rows.sort(reverse=True)
-        for row in rows:
-            values = [row]
-            for column in table_stats:
-                if row in table_stats[column]:
-                    value = table_stats[column][row]
-                else:
-                    value = ""
-                value = util.convert_to_scientific(value)
-                values.append(value)
+        custom_order = [
+            "count",
+            "unique",
+            "top",
+            "freq",
+            "mean",
+            "std",
+            "min",
+            "25%",
+            "50%",
+            "75%",
+            "max",
+        ]
 
-            self._table.add_row(values)
+        for row in custom_order:
+            if row.lower() in [r.lower() for r in columns_to_include_in_report]:
+                values = [row]
+                for column in table_stats:
+                    if row in table_stats[column]:
+                        value = table_stats[column][row]
+                    else:
+                        value = ""
+                    # value = util.convert_to_scientific(value)
+                    values.append(value)
+
+                self._table.add_row(values)
+
+        unique_id = str(uuid.uuid4()).replace("-", "")
+        column_styles = _generate_column_styles(columns_with_styles, unique_id)
+
+        if message_check:
+            message_content = _generate_message(columns_with_styles, list(columns))
+            warning_background = "#FFFFCC"
+            warning_title = "Warning: "
+        else:
+            message_content = ""
+            warning_background = "white"
+            warning_title = ""
+
+        database = ConnectionManager.current.url
+        db_driver = ConnectionManager.current._get_database_information()["driver"]
+        if "duckdb" in database:
+            db_message = ""
+        else:
+            db_message = f"""Following statistics are not available in
+            {db_driver}: STD, 25%, 50%, 75%"""
+
+        db_html = (
+            f"<div style='position: sticky; left: 0; padding: 10px; "
+            f"font-size: 12px; color: #FFA500'>"
+            f"<strong></strong> {db_message}"
+            "</div>"
+        )
+
+        message_html = (
+            f"<div style='position: sticky; left: 0; padding: 10px; "
+            f"font-size: 12px; color: black; background-color: {warning_background};'>"
+            f"<strong>{warning_title}</strong> {message_content}"
+            "</div>"
+        )
 
         # Inject css to html to make first column sticky
         sticky_column_css = """<style>
@@ -291,16 +450,23 @@ class TableDescription(DatabaseInspection):
   position: sticky;
   left: 0;
   background-color: var(--jp-cell-editor-background);
+  font-weight: bold;
 }
  #profile-table thead tr th:first-child {
   position: sticky;
   left: 0;
   background-color: var(--jp-cell-editor-background);
+  font-weight: bold; /* Adding bold text */
 }
             </style>"""
         self._table_html = HTML(
-            sticky_column_css
-            + self._table.get_html_string(attributes={"id": "profile-table"})
+            db_html
+            + sticky_column_css
+            + column_styles
+            + self._table.get_html_string(
+                attributes={"id": f"profile-table-{unique_id}"}
+            )
+            + message_html
         ).__html__()
 
         self._table_txt = self._table.get_string()

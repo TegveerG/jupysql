@@ -10,17 +10,20 @@ from textwrap import dedent
 from unittest.mock import patch
 
 import polars as pl
+import pandas as pd
 import pytest
 from sqlalchemy import create_engine
 from IPython.core.error import UsageError
-from sql.connection import Connection
+from sql.connection import ConnectionManager
 from sql.magic import SqlMagic
-from sql.run import ResultSet
+from sql.run.resultset import ResultSet
 from sql import magic
+from sql.warnings import JupySQLQuotedNamedParametersWarning
 
 from conftest import runsql
 from sql.connection import PLOOMBER_DOCS_LINK_STR
 from ploomber_core.exceptions import COMMUNITY
+import psutil
 
 COMMUNITY = COMMUNITY.strip()
 
@@ -40,10 +43,19 @@ def test_print(ip):
     assert re.search(r"1\s+\|\s+foo", str(result))
 
 
-def test_plain_style(ip):
-    ip.run_line_magic("config", "SqlMagic.style = 'PLAIN_COLUMNS'")
+@pytest.mark.parametrize(
+    "style, expected",
+    [
+        ("'PLAIN_COLUMNS'", r"1\s+foo"),
+        ("'DEFAULT'", r" 1 \| foo  \|\n\|"),
+        ("'SINGLE_BORDER'", r"│\n├───┼──────┤\n│ 1 │ foo  │\n│"),
+        ("'MSWORD_FRIENDLY'", r"\n\| 1 \| foo  \|\n\|"),
+    ],
+)
+def test_styles(ip, style, expected):
+    ip.run_line_magic("config", f"SqlMagic.style = {style}")
     result = runsql(ip, "SELECT * FROM test;")
-    assert re.search(r"1\s+\|\s+foo", str(result))
+    assert re.search(expected, str(result))
 
 
 @pytest.mark.skip
@@ -76,7 +88,7 @@ def test_result_var(ip, capsys):
     assert "Returning data to local variable" not in out
 
 
-def test_result_var_link(ip, capsys):
+def test_result_var_link(ip):
     ip.run_cell_magic(
         "sql",
         "",
@@ -87,14 +99,16 @@ def test_result_var_link(ip, capsys):
         """,
     )
     result = ip.user_global_ns["x"]
-    out, _ = capsys.readouterr()
+
     assert (
         "<a href=https://en.wikipedia.org/wiki/Bertolt_Brecht>"
-        "https://en.wikipedia.org/wiki/Bertolt_Brecht</a>" in result._repr_html_()
-        and "<a href=https://en.wikipedia.org/wiki/William_Shakespeare>"
-        "https://en.wikipedia.org/wiki/William_Shakespeare</a>" in result._repr_html_()
-    )
-    assert "Returning data to local variable" not in out
+        "https://en.wikipedia.org/wiki/Bertolt_Brecht</a>"
+    ) in result._repr_html_()
+
+    assert (
+        "<a href=https://en.wikipedia.org/wiki/William_Shakespeare>"
+        "https://en.wikipedia.org/wiki/William_Shakespeare</a>"
+    ) in result._repr_html_()
     assert "<a href=google_link>google_link</a>" not in result._repr_html_()
 
 
@@ -111,34 +125,66 @@ def test_result_var_multiline_shovel(ip):
     assert "Shakespeare" in str(result) and "Brecht" in str(result)
 
 
-def test_return_result_var(ip, capsys):
-    # Assert that no result is returned when using regular result var syntax <<
-    result = ip.run_cell_magic(
-        "sql",
-        "",
-        """
-        sqlite://
-        x <<
-        SELECT last_name FROM author;
-        """,
-    )
+@pytest.mark.parametrize(
+    "sql_statement, expected_result",
+    [
+        (
+            """
+            sqlite://
+            x <<
+            SELECT last_name FROM author;
+            """,
+            None,
+        ),
+        (
+            """
+            sqlite://
+            x= <<
+            SELECT last_name FROM author;
+            """,
+            {"last_name": ("Shakespeare", "Brecht")},
+        ),
+        (
+            """
+            sqlite://
+            x = <<
+            SELECT last_name FROM author;
+            """,
+            {"last_name": ("Shakespeare", "Brecht")},
+        ),
+        (
+            """
+            sqlite://
+            x = <<
+            SELECT last_name FROM author;
+            """,
+            {"last_name": ("Shakespeare", "Brecht")},
+        ),
+        (
+            """
+            sqlite://
+            x =     <<
+            SELECT last_name FROM author;
+            """,
+            {"last_name": ("Shakespeare", "Brecht")},
+        ),
+        (
+            """
+            sqlite://
+            x      =     <<
+            SELECT last_name FROM author;
+            """,
+            {"last_name": ("Shakespeare", "Brecht")},
+        ),
+    ],
+)
+def test_return_result_var(ip, sql_statement, expected_result):
+    result = ip.run_cell_magic("sql", "", sql_statement)
     var = ip.user_global_ns["x"]
     assert "Shakespeare" in str(var) and "Brecht" in str(var)
-    assert result is None
-
-    # Assert that correct result is returned when using return result var syntax = <<
-    result = ip.run_cell_magic(
-        "sql",
-        "",
-        """
-        sqlite://
-        x= <<
-        SELECT last_name FROM author;
-        """,
-    )
-    var = ip.user_global_ns["x"]
-    assert "Shakespeare" in str(var) and "Brecht" in str(var)
-    assert result.dict() == {"last_name": ("Shakespeare", "Brecht")}
+    if result is not None:
+        result = result.dict()
+    assert result == expected_result
 
 
 def test_access_results_by_keys(ip):
@@ -166,8 +212,12 @@ def test_persist_missing_pandas(ip, monkeypatch):
 
     ip.run_cell("results = %sql SELECT * FROM test;")
     ip.run_cell("results_dframe = results.DataFrame()")
-    result = ip.run_cell("%sql --persist sqlite:// results_dframe")
-    assert "pip install pandas" in str(result.error_in_exec)
+
+    with pytest.raises(UsageError) as excinfo:
+        ip.run_cell("%sql --persist sqlite:// results_dframe")
+
+    assert excinfo.value.error_type == "MissingPackageError"
+    assert "pip install pandas" in str(excinfo.value)
 
 
 def test_persist(ip):
@@ -191,30 +241,45 @@ def test_persist_no_index(ip):
 @pytest.mark.parametrize(
     "sql_statement, expected_error",
     [
-        ("%%sql --stuff\n SELECT * FROM test", "Unrecognized argument(s)"),
-        ("%%sql --unknown\n SELECT * FROM test", "Unrecognized argument(s)"),
-        ("%%sql --invalid-arg\n SELECT * FROM test", "Unrecognized argument(s)"),
-        ("%%sql -invalid-arg\n SELECT * FROM test", "Unrecognized argument(s)"),
-        ("%%sql \n SELECT * FROM test", None),
-        ("%sql select * FROM penguins.csv --some", None),
+        ("%%sql --arg\n SELECT * FROM test", "Unrecognized argument(s): --arg"),
+        ("%%sql -arg\n SELECT * FROM test", "Unrecognized argument(s): -arg"),
         ("%%sql --persist '--some' \n SELECT * FROM test", "not a valid identifier"),
     ],
 )
 def test_unrecognized_arguments_cell_magic(ip, sql_statement, expected_error):
-    result = ip.run_cell(sql_statement)
-    assert (result.error_in_exec is not None) == (expected_error is not None)
-    if expected_error:
-        assert expected_error in str(result.error_in_exec)
+    with pytest.raises(UsageError) as excinfo:
+        ip.run_cell(sql_statement)
+
+    assert expected_error in str(excinfo.value)
+
+
+def test_ignore_argument_like_strings_if_they_come_after_the_sql_query(ip):
+    assert ip.run_cell("%sql select * FROM test --some")
 
 
 def test_persist_invalid_identifier(ip):
-    result = ip.run_cell("%sql --persist sqlite:// not an identifier")
-    assert "not a valid identifier" in str(result.error_in_exec)
+    with pytest.raises(UsageError) as excinfo:
+        ip.run_cell("%sql --persist sqlite:// not an identifier")
+
+    assert "not a valid identifier" in str(excinfo.value)
 
 
 def test_persist_undefined_variable(ip):
-    result = ip.run_cell("%sql --persist sqlite:// not_a_variable")
-    assert "it's undefined" in str(result.error_in_exec)
+    with pytest.raises(UsageError) as excinfo:
+        ip.run_cell("%sql --persist sqlite:// not_a_variable")
+
+    assert "Expected 'not_a_variable' to be a pd.DataFrame but it's undefined" in str(
+        excinfo.value
+    )
+
+
+def test_persist_non_frame_raises(ip):
+    ip.run_cell("not_a_dataframe = 22")
+
+    with pytest.raises(UsageError) as excinfo:
+        ip.run_cell("%sql --persist sqlite:// not_a_dataframe")
+
+    assert "is not a Pandas DataFrame or Series" in str(excinfo.value)
 
 
 def test_append(ip):
@@ -228,26 +293,13 @@ def test_append(ip):
     assert appended[0][0] == persisted[0][0] * 2
 
 
-def test_persist_nonexistent_raises(ip):
-    runsql(ip, "")
-    result = ip.run_cell("%sql --persist sqlite:// no_such_dataframe")
-    assert result.error_in_exec
+def test_persist_missing_argument(ip):
+    with pytest.raises(UsageError) as excinfo:
+        ip.run_cell("%sql --persist sqlite://")
 
-
-def test_persist_non_frame_raises(ip):
-    ip.run_cell("not_a_dataframe = 22")
-    runsql(ip, "")
-    result = ip.run_cell("%sql --persist sqlite:// not_a_dataframe")
-    assert isinstance(result.error_in_exec, UsageError)
-    assert (
-        "is not a Pandas DataFrame or Series".lower()
-        in str(result.error_in_exec).lower()
+    assert "Expected '' to be a pd.DataFrame but it's not a valid identifier" in str(
+        excinfo.value
     )
-
-
-def test_persist_bare(ip):
-    result = ip.run_cell("%sql --persist sqlite://")
-    assert result.error_in_exec
 
 
 def get_table_rows_as_dataframe(ip, table, name=None):
@@ -366,34 +418,42 @@ def test_persist_replace_override_reverted_order(
     table_df = get_table_rows_as_dataframe(
         ip, table=second_test_table, name=saved_df_name
     )
-    persist_out = ip.run_cell(f"%sql --persist sqlite:// {table_df}")
+
+    with pytest.raises(UsageError) as excinfo:
+        ip.run_cell(f"%sql --persist sqlite:// {table_df}")
 
     # To test the second --persist executes not successfully
     assert (
         f"Table '{saved_df_name}' already exists. Consider using \
 --persist-replace to drop the table before persisting the data frame"
-        in str(persist_out.error_in_exec)
+        in str(excinfo.value)
     )
 
-    out = ip.run_cell(f"%sql SELECT * FROM {table_df}")
     # To test the persisted data is from --persist-replace
+    out = ip.run_cell(f"%sql SELECT * FROM {table_df}")
     assert out.result == expected_result
-    assert out.error_in_exec is None
 
 
 @pytest.mark.parametrize(
-    "test_table", [("test"), ("author"), ("website"), ("number_table")]
+    "test_table",
+    [
+        ("test"),
+        ("author"),
+        ("website"),
+        ("number_table"),
+    ],
 )
 def test_persist_and_append_use_together(ip, test_table):
     # Test error message when use --persist and --append together
     saved_df_name = get_table_rows_as_dataframe(ip, table=test_table)
-    out = ip.run_cell(f"%sql --persist-replace --append sqlite:// {saved_df_name}")
+
+    with pytest.raises(UsageError) as excinfo:
+        ip.run_cell(f"%sql --persist-replace --append sqlite:// {saved_df_name}")
 
     assert """You cannot simultaneously persist and append data to a dataframe;
                   please choose to utilize either one or the other.""" in str(
-        out.error_in_exec
+        excinfo.value
     )
-    assert (out.error_in_exec.error_type) == "UsageError"
 
 
 @pytest.mark.parametrize(
@@ -464,8 +524,16 @@ def test_persist_replace_twice(
 
 
 def test_connection_args_enforce_json(ip):
-    result = ip.run_cell('%sql --connection_arguments {"badlyformed":true')
-    assert result.error_in_exec
+    with pytest.raises(UsageError) as excinfo:
+        ip.run_cell('%sql --connection_arguments {"badlyformed":true')
+
+    expected_message = (
+        "Expecting property name enclosed in double quotes"
+        if platform.system() == "Windows"
+        else "Expecting ',' delimiter"
+    )
+
+    assert expected_message in str(excinfo.value)
 
 
 @pytest.mark.skipif(platform.system() == "Windows", reason="failing on windows")
@@ -480,15 +548,6 @@ def test_connection_args_single_quotes(ip):
     ip.run_cell("%sql --connection_arguments '{\"timeout\": 10}' sqlite:///:memory:")
     result = ip.run_cell("%sql --connections")
     assert "timeout" in result.result["sqlite:///:memory:"].connect_args
-
-
-# TODO: support
-# @with_setup(_setup_author, _teardown_author)
-# def test_persist_with_connection_info():
-#     ip.run_cell("results = %sql SELECT * FROM author;")
-#     ip.run_line_magic('sql', 'sqlite:// PERSIST results.DataFrame()')
-#     persisted = ip.run_line_magic('sql', 'SELECT * FROM results')
-#     assert 'Shakespeare' in str(persisted)
 
 
 def test_displaylimit_no_limit(ip):
@@ -514,8 +573,9 @@ def test_displaylimit_default(ip):
     ip.run_cell("%sql INSERT INTO number_table VALUES (4, 3)")
     ip.run_cell("%sql INSERT INTO number_table VALUES (4, 3)")
 
-    out = runsql(ip, "SELECT * FROM number_table;")
-    assert "truncated to displaylimit of 10" in out._repr_html_()
+    out = ip.run_cell("%sql SELECT * FROM number_table;").result
+
+    assert "Truncated to displaylimit of 10" in out._repr_html_()
 
 
 def test_displaylimit(ip):
@@ -526,6 +586,8 @@ def test_displaylimit(ip):
 
     assert "Brecht" in result._repr_html_()
     assert "Shakespeare" not in result._repr_html_()
+    assert "Brecht" in repr(result)
+    assert "Shakespeare" not in repr(result)
 
 
 @pytest.mark.parametrize("config_value, expected_length", [(3, 3), (6, 6)])
@@ -536,7 +598,7 @@ def test_displaylimit_enabled_truncated_length(ip, config_value, expected_length
 
     ip.run_cell(f"%config SqlMagic.displaylimit = {config_value}")
     out = runsql(ip, "SELECT * FROM number_table;")
-    assert f"truncated to displaylimit of {expected_length}" in out._repr_html_()
+    assert f"Truncated to displaylimit of {expected_length}" in out._repr_html_()
 
 
 @pytest.mark.parametrize("config_value", [(None), (0)])
@@ -550,7 +612,7 @@ def test_displaylimit_enabled_no_limit(
 
     ip.run_cell(f"%config SqlMagic.displaylimit = {config_value}")
     out = runsql(ip, "SELECT * FROM number_table;")
-    assert "truncated to displaylimit of " not in out._repr_html_()
+    assert "Truncated to displaylimit of " not in out._repr_html_()
 
 
 @pytest.mark.parametrize(
@@ -604,10 +666,7 @@ def test_displaylimit_with_conditional_clause(
         out = runsql(ip, query_clause)
 
     if expected_truncated_length:
-        assert (
-            f"{expected_truncated_length} rows, truncated to displaylimit of 10"
-            in out._repr_html_()
-        )
+        assert "Truncated to displaylimit of 10" in out._repr_html_()
 
 
 def test_column_local_vars(ip):
@@ -651,7 +710,7 @@ def test_autopolars(ip):
     ip.run_line_magic("config", "SqlMagic.autopolars = True")
     dframe = runsql(ip, "SELECT * FROM test;")
 
-    assert type(dframe) == pl.DataFrame
+    assert isinstance(dframe, pl.DataFrame)
     assert not dframe.is_empty()
     assert len(dframe.shape) == 2
     assert dframe["name"][0] == "foo"
@@ -689,28 +748,29 @@ def test_autopolars_infer_schema_length(ip):
 
 
 def test_mutex_autopolars_autopandas(ip):
+    ip.run_line_magic("config", "SqlMagic.autopolars = False")
+    ip.run_line_magic("config", "SqlMagic.autopandas = False")
+
     dframe = runsql(ip, "SELECT * FROM test;")
-    assert type(dframe) == ResultSet
+    assert isinstance(dframe, ResultSet)
 
     ip.run_line_magic("config", "SqlMagic.autopolars = True")
     dframe = runsql(ip, "SELECT * FROM test;")
-    assert type(dframe) == pl.DataFrame
-
-    import pandas as pd
+    assert isinstance(dframe, pl.DataFrame)
 
     ip.run_line_magic("config", "SqlMagic.autopandas = True")
     dframe = runsql(ip, "SELECT * FROM test;")
-    assert type(dframe) == pd.DataFrame
+    assert isinstance(dframe, pd.DataFrame)
 
     # Test that re-enabling autopolars works
     ip.run_line_magic("config", "SqlMagic.autopolars = True")
     dframe = runsql(ip, "SELECT * FROM test;")
-    assert type(dframe) == pl.DataFrame
+    assert isinstance(dframe, pl.DataFrame)
 
     # Disabling autopolars at this point should result in the default behavior
     ip.run_line_magic("config", "SqlMagic.autopolars = False")
     dframe = runsql(ip, "SELECT * FROM test;")
-    assert type(dframe) == ResultSet
+    assert isinstance(dframe, ResultSet)
 
 
 def test_csv(ip):
@@ -747,11 +807,13 @@ def test_sql_from_file(ip):
 
 
 def test_sql_from_nonexistent_file(ip):
-    ip.run_line_magic("config", "SqlMagic.autopandas = False")
-    with tempfile.TemporaryDirectory() as tempdir:
-        fname = os.path.join(tempdir, "nonexistent.sql")
-        result = ip.run_cell("%sql --file " + fname)
-        assert isinstance(result.error_in_exec, FileNotFoundError)
+    with pytest.raises(UsageError) as excinfo:
+        ip.run_cell("%sql --file some_file_that_doesnt_exist.sql")
+
+    assert "No such file or directory: 'some_file_that_doesnt_exist.sql" in str(
+        excinfo.value
+    )
+    assert excinfo.value.error_type == "FileNotFoundError"
 
 
 def test_dict(ip):
@@ -851,48 +913,65 @@ def test_closed_connections_are_no_longer_listed(ip):
 
 
 def test_close_connection(ip, tmp_empty):
-    # open two connections
+    process = psutil.Process()
+
     ip.run_cell("%sql sqlite:///one.db")
     ip.run_cell("%sql sqlite:///two.db")
 
-    # close them
+    # check files are open
+    assert {Path(f.path).name for f in process.open_files()} >= {"one.db", "two.db"}
+
+    # close connections
     ip.run_cell("%sql -x sqlite:///one.db")
     ip.run_cell("%sql --close sqlite:///two.db")
 
-    assert "sqlite:///one.db" not in Connection.connections
-    assert "sqlite:///two.db" not in Connection.connections
+    # connections should not longer appear
+    assert "sqlite:///one.db" not in ConnectionManager.connections
+    assert "sqlite:///two.db" not in ConnectionManager.connections
+
+    # files should be closed
+    assert {Path(f.path).name for f in process.open_files()} & {
+        "one.db",
+        "two.db",
+    } == set()
+
+
+@pytest.mark.parametrize(
+    "close_cell",
+    [
+        "%sql -x first",
+        "%sql --close first",
+    ],
+)
+def test_close_connection_with_alias(ip, tmp_empty, close_cell):
+    process = psutil.Process()
+
+    ip.run_cell("%sql sqlite:///one.db --alias first")
+
+    assert {Path(f.path).name for f in process.open_files()} >= {"one.db"}
+
+    ip.run_cell(close_cell)
+
+    assert "sqlite:///one.db" not in ConnectionManager.connections
+    assert "first" not in ConnectionManager.connections
+    assert "one.db" not in {Path(f.path).name for f in process.open_files()}
 
 
 def test_alias(clean_conns, ip_empty, tmp_empty):
     ip_empty.run_cell("%sql sqlite:///one.db --alias one")
-    assert {"one"} == set(Connection.connections)
+    assert {"one"} == set(ConnectionManager.connections)
 
 
 def test_alias_existing_engine(clean_conns, ip_empty, tmp_empty):
     ip_empty.user_global_ns["first"] = create_engine("sqlite:///first.db")
     ip_empty.run_cell("%sql first --alias one")
-    assert {"one"} == set(Connection.connections)
+    assert {"one"} == set(ConnectionManager.connections)
 
 
-def test_alias_custom_connection(clean_conns, ip_empty, tmp_empty):
+def test_alias_dbapi_connection(clean_conns, ip_empty, tmp_empty):
     ip_empty.user_global_ns["first"] = create_engine("sqlite://")
     ip_empty.run_cell("%sql first --alias one")
-    assert {"one"} == set(Connection.connections)
-
-
-def test_close_connection_with_alias(ip, tmp_empty):
-    # open two connections
-    ip.run_cell("%sql sqlite:///one.db --alias one")
-    ip.run_cell("%sql sqlite:///two.db --alias two")
-
-    # close them
-    ip.run_cell("%sql -x one")
-    ip.run_cell("%sql --close two")
-
-    assert "sqlite:///one.db" not in Connection.connections
-    assert "sqlite:///two.db" not in Connection.connections
-    assert "one" not in Connection.connections
-    assert "two" not in Connection.connections
+    assert {"one"} == set(ConnectionManager.connections)
 
 
 def test_close_connection_with_existing_engine_and_alias(ip, tmp_empty):
@@ -907,13 +986,13 @@ def test_close_connection_with_existing_engine_and_alias(ip, tmp_empty):
     ip.run_cell("%sql -x one")
     ip.run_cell("%sql --close two")
 
-    assert "sqlite:///first.db" not in Connection.connections
-    assert "sqlite:///second.db" not in Connection.connections
-    assert "first" not in Connection.connections
-    assert "second" not in Connection.connections
+    assert "sqlite:///first.db" not in ConnectionManager.connections
+    assert "sqlite:///second.db" not in ConnectionManager.connections
+    assert "first" not in ConnectionManager.connections
+    assert "second" not in ConnectionManager.connections
 
 
-def test_close_connection_with_custom_connection_and_alias(ip, tmp_empty):
+def test_close_connection_with_dbapi_connection_and_alias(ip, tmp_empty):
     ip.user_global_ns["first"] = create_engine("sqlite:///first.db")
     ip.user_global_ns["second"] = create_engine("sqlite:///second.db")
 
@@ -925,10 +1004,10 @@ def test_close_connection_with_custom_connection_and_alias(ip, tmp_empty):
     ip.run_cell("%sql -x one")
     ip.run_cell("%sql --close two")
 
-    assert "sqlite:///first.db" not in Connection.connections
-    assert "sqlite:///second.db" not in Connection.connections
-    assert "first" not in Connection.connections
-    assert "second" not in Connection.connections
+    assert "sqlite:///first.db" not in ConnectionManager.connections
+    assert "sqlite:///second.db" not in ConnectionManager.connections
+    assert "first" not in ConnectionManager.connections
+    assert "second" not in ConnectionManager.connections
 
 
 def test_creator_no_argument_raises(ip_empty):
@@ -1022,10 +1101,10 @@ Set the environment variable $DATABASE_URL
 
 
 def test_error_on_invalid_connection_string(ip_empty, clean_conns):
-    result = ip_empty.run_cell("%sql some invalid connection string")
+    with pytest.raises(UsageError) as excinfo:
+        ip_empty.run_cell("%sql some invalid connection string")
 
-    assert invalid_connection_string.strip() == str(result.error_in_exec)
-    assert isinstance(result.error_in_exec, UsageError)
+    assert invalid_connection_string.strip() == str(excinfo.value)
 
 
 invalid_connection_string_format = f"""\
@@ -1040,18 +1119,19 @@ Ref: https://docs.sqlalchemy.org/en/20/core/engines.html#database-urls
 
 
 def test_error_on_invalid_connection_string_format(ip_empty, clean_conns):
-    result = ip_empty.run_cell("%sql something://")
+    with pytest.raises(UsageError) as excinfo:
+        ip_empty.run_cell("%sql something://")
 
-    assert invalid_connection_string_format.strip() == str(result.error_in_exec)
-    assert isinstance(result.error_in_exec, UsageError)
+    assert invalid_connection_string_format.strip() == str(excinfo.value)
 
 
 def test_error_on_invalid_connection_string_with_existing_conns(ip_empty, clean_conns):
     ip_empty.run_cell("%sql sqlite://")
-    result = ip_empty.run_cell("%sql something://")
 
-    assert invalid_connection_string_format.strip() == str(result.error_in_exec)
-    assert isinstance(result.error_in_exec, UsageError)
+    with pytest.raises(UsageError) as excinfo:
+        ip_empty.run_cell("%sql something://")
+
+    assert invalid_connection_string_format.strip() == str(excinfo.value)
 
 
 invalid_connection_string_with_possible_typo = f"""
@@ -1066,19 +1146,18 @@ Perhaps you meant to use driver the dialect: "sqlite"
 
 def test_error_on_invalid_connection_string_with_possible_typo(ip_empty, clean_conns):
     ip_empty.run_cell("%sql sqlite://")
-    result = ip_empty.run_cell("%sql sqlit://")
 
-    assert invalid_connection_string_with_possible_typo.strip() == str(
-        result.error_in_exec
-    )
-    assert isinstance(result.error_in_exec, UsageError)
+    with pytest.raises(UsageError) as excinfo:
+        ip_empty.run_cell("%sql sqlit://")
+
+    assert invalid_connection_string_with_possible_typo.strip() == str(excinfo.value)
 
 
 invalid_connection_string_duckdb = f"""
 An error happened while creating the connection: connect(): incompatible function arguments. The following argument types are supported:
     1. (database: str = ':memory:', read_only: bool = False, config: dict = None) -> duckdb.DuckDBPyConnection
 
-Invoked with: kwargs: host='invalid_db'.
+Invoked with: kwargs: host='invalid_db', config={{}}.
 
 Perhaps you meant to use the 'duckdb' db 
 To find more information regarding connection: https://jupysql.ploomber.io/en/latest/integrations/duckdb.html
@@ -1094,10 +1173,10 @@ Pass a valid connection string:
 
 
 def test_error_on_invalid_connection_string_duckdb(ip_empty, clean_conns):
-    result = ip_empty.run_cell("%sql duckdb://invalid_db")
+    with pytest.raises(UsageError) as excinfo:
+        ip_empty.run_cell("%sql duckdb://invalid_db")
 
-    assert invalid_connection_string_duckdb.strip() == str(result.error_in_exec)
-    assert isinstance(result.error_in_exec, UsageError)
+    assert invalid_connection_string_duckdb.strip() == str(excinfo.value)
 
 
 def test_jupysql_alias():
@@ -1198,29 +1277,25 @@ def test_save_with_number_table(
 
 
 def test_save_with_non_existing_with(ip):
-    with pytest.warns(FutureWarning) as record:
+    with pytest.raises(UsageError) as excinfo:
         ip.run_cell(
-            "%sql --with non_existing_sub_query " "SELECT * FROM non_existing_sub_query"
+            "%sql --with non_existing_sub_query SELECT * FROM non_existing_sub_query"
         )
-    assert len(record) == 1
-    assert (
-        "CTE dependencies are now automatically inferred, you can omit the "
-        "--with arguments. Using --with will raise an exception in the next "
-        "major release so please remove it." in record[0].message.args[0]
+
+    assert '"non_existing_sub_query" is not a valid snippet identifier.' in str(
+        excinfo.value
     )
+    assert excinfo.value.error_type == "UsageError"
 
 
-def test_save_with_non_existing_table(ip, capsys):
-    ip.run_cell("%sql --save my_query SELECT * FROM non_existing_table")
-    out, _ = capsys.readouterr()
-    assert "(sqlite3.OperationalError) no such table: non_existing_table" in out
+def test_save_with_non_existing_table(ip):
+    with pytest.raises(UsageError) as excinfo:
+        ip.run_cell("%sql --save my_query SELECT * FROM non_existing_table")
 
-
-def test_save_with_bad_query_save(ip, capsys):
-    ip.run_cell("%sql --save my_query SELECT * non_existing_table")
-    ip.run_cell("%sql --with my_query SELECT * FROM my_query")
-    out, err = capsys.readouterr()
-    assert '(sqlite3.OperationalError) near "non_existing_table": syntax error' in err
+    assert excinfo.value.error_type == "RuntimeError"
+    assert "(sqlite3.OperationalError) no such table: non_existing_table" in str(
+        excinfo.value
+    )
 
 
 def test_interact_basic_data_types(ip, capsys):
@@ -1261,7 +1336,331 @@ def test_interact_and_missing_ipywidgets_installed(ip):
     with patch.dict(sys.modules):
         sys.modules["ipywidgets"] = None
         ip.user_global_ns["my_variable"] = 5
-        out = ip.run_cell(
-            "%sql --interact my_variable SELECT * FROM author LIMIT {{my_variable}}"
-        )
-        assert isinstance(out.error_in_exec, ModuleNotFoundError)
+
+        with pytest.raises(ModuleNotFoundError) as excinfo:
+            ip.run_cell(
+                "%sql --interact my_variable SELECT * FROM author LIMIT {{my_variable}}"
+            )
+
+    assert "'ipywidgets' is required to use '--interactive argument'" in str(
+        excinfo.value
+    )
+
+
+@pytest.mark.parametrize(
+    "file_content, expect, revert",
+    [
+        (
+            """
+[tool.jupysql.SqlMagic]
+autocommit = false
+autolimit = 1
+style = "RANDOM"
+""",
+            [
+                "Found pyproject.toml from '%s'",
+                "Settings changed:",
+                r"autocommit\s*\|\s*False",
+                r"autolimit\s*\|\s*1",
+                r"style\s*\|\s*RANDOM",
+            ],
+            {"autocommit": True, "autolimit": 0, "style": "DEFAULT"},
+        ),
+        (
+            """
+[tool.jupysql.SqlMagic]
+""",
+            ["Found pyproject.toml from '%s'"],
+            {},
+        ),
+        (
+            """
+[test]
+github = "ploomber/jupysql"
+""",
+            ["Found pyproject.toml from '%s'"],
+            {},
+        ),
+        (
+            """
+[tool.pkgmt]
+github = "ploomber/jupysql"
+""",
+            ["Found pyproject.toml from '%s'"],
+            {},
+        ),
+        (
+            """
+[tool.jupysql.test]
+github = "ploomber/jupysql"
+""",
+            ["Found pyproject.toml from '%s'"],
+            {},
+        ),
+        (
+            "",
+            ["Found pyproject.toml from '%s'"],
+            {},
+        ),
+    ],
+)
+def test_valid_loading_toml(tmp_empty, ip, capsys, file_content, expect, revert):
+    Path("pyproject.toml").write_text(file_content)
+    toml_dir = os.getcwd()
+    os.makedirs("sub")
+    os.chdir("sub")
+
+    ip.run_cell("%load_ext sql").result
+    out, _ = capsys.readouterr()
+
+    expect[0] = expect[0] % (re.escape(toml_dir))
+    assert all(re.search(substring, out) for substring in expect)
+
+    sql = ip.find_cell_magic("sql").__self__
+    [setattr(sql, config, value) for config, value in revert.items()]
+
+
+def test_no_toml(tmp_empty, ip, capsys):
+    os.makedirs("sub")
+    os.chdir("sub")
+
+    ip.run_cell("%load_ext sql").result
+    out, _ = capsys.readouterr()
+
+    assert out == ""
+
+
+@pytest.mark.parametrize(
+    "file_content, error_msg",
+    [
+        (
+            """
+[tool.jupysql.SqlMagic]
+autocommit = true
+autocommit = true
+""",
+            "Duplicate key found : 'autocommit'",
+        ),
+        (
+            """
+[tool.jupySql.SqlMagic]
+autocommit = true
+""",
+            "'jupySql' is an invalid section name. Did you mean 'jupysql'?",
+        ),
+        (
+            """
+[tool.jupysql.SqlMagic]
+autocommit = True
+""",
+            (
+                "Invalid value 'True' in 'autocommit = True'. "
+                "Valid boolean values: true, false"
+            ),
+        ),
+        (
+            """
+[tool.jupysql.SqlMagic]
+autocommit = invalid
+""",
+            (
+                "Invalid value 'invalid' in 'autocommit = invalid'. "
+                "To use str value, enclose it with ' or \"."
+            ),
+        ),
+    ],
+)
+def test_error_on_toml_parsing(tmp_empty, ip, capsys, file_content, error_msg):
+    Path("pyproject.toml").write_text(file_content)
+    toml_dir = os.getcwd()
+    found_statement = "Found pyproject.toml from '%s'" % (toml_dir)
+    os.makedirs("sub")
+    os.chdir("sub")
+
+    with pytest.raises(UsageError) as excinfo:
+        ip.run_cell("%load_ext sql")
+    out, _ = capsys.readouterr()
+
+    assert out.strip() == found_statement
+    assert excinfo.value.error_type == "ConfigurationError"
+    assert str(excinfo.value) == error_msg
+
+
+def test_valid_and_invalid_configs(tmp_empty, ip, capsys):
+    Path("pyproject.toml").write_text(
+        """
+[tool.jupysql.SqlMagic]
+autocomm = true
+autop = false
+autolimit = "text"
+invalid = false
+displaycon = false
+"""
+    )
+    toml_dir = os.getcwd()
+    os.makedirs("sub")
+    os.chdir("sub")
+
+    ip.run_cell("%load_ext sql")
+    out, _ = capsys.readouterr()
+    expect = [
+        "Found pyproject.toml from '%s'" % (re.escape(toml_dir)),
+        "'autocomm' is an invalid configuration. Did you mean 'autocommit'?",
+        (
+            "'autop' is an invalid configuration. "
+            "Did you mean 'autopandas', or 'autopolars'?"
+        ),
+        (
+            "'text' is an invalid value for 'autolimit'. "
+            "Please use int value instead."
+        ),
+        r"displaycon\s*\|\s*False",
+    ]
+    assert all(re.search(substring, out) for substring in expect)
+
+    # confirm the correct changes are applied
+    confirm = {"displaycon": False, "autolimit": 0}
+    sql = ip.find_cell_magic("sql").__self__
+    assert all([getattr(sql, config) == value for config, value in confirm.items()])
+
+    # revert back to a default setting
+    setattr(sql, "displaycon", True)
+
+
+@pytest.mark.parametrize(
+    "fixture_name",
+    [
+        "ip",
+        "ip_dbapi",
+    ],
+)
+def test_interpolation_ignore_literals(fixture_name, request):
+    ip = request.getfixturevalue(fixture_name)
+
+    ip.run_cell("%config SqlMagic.named_parameters = True")
+
+    # this isn't a parameter because it's quoted (':last_name')
+    result = ip.run_cell(
+        "%sql select * from author where last_name = ':last_name'"
+    ).result
+    assert result.dict() == {}
+
+
+def test_sqlalchemy_interpolation(ip):
+    ip.run_cell("%config SqlMagic.named_parameters = True")
+
+    ip.run_cell("last_name = 'Shakespeare'")
+
+    # define another variable to ensure the test doesn't break if there are more
+    # variables in the namespace
+    ip.run_cell("first_name = 'William'")
+
+    result = ip.run_cell(
+        "%sql select * from author where last_name = :last_name"
+    ).result
+
+    assert result.dict() == {
+        "first_name": ("William",),
+        "last_name": ("Shakespeare",),
+        "year_of_death": (1616,),
+    }
+
+
+def test_sqlalchemy_interpolation_missing_parameter(ip):
+    ip.run_cell("%config SqlMagic.named_parameters = True")
+
+    with pytest.raises(UsageError) as excinfo:
+        ip.run_cell("%sql select * from author where last_name = :last_name")
+
+    assert (
+        "Cannot execute query because the following variables are undefined: last_name"
+        in str(excinfo.value)
+    )
+
+
+@pytest.mark.parametrize(
+    "fixture_name",
+    [
+        "ip",
+        "ip_dbapi",
+    ],
+)
+def test_sqlalchemy_insert_literals_with_colon_character(fixture_name, request):
+    ip = request.getfixturevalue(fixture_name)
+
+    ip.run_cell(
+        """%%sql
+CREATE TABLE names (
+    name VARCHAR(50) NOT NULL
+);
+
+INSERT INTO names (name)
+VALUES
+    ('John'),
+    (':Mary'),
+    ('Alex'),
+    (':Lily'),
+    ('Michael'),
+    ('Robert'),
+    (':Sarah'),
+    ('Jennifer'),
+    (':Tom'),
+    ('Jessica');
+"""
+    )
+
+    result = ip.run_cell("%sql SELECT * FROM names WHERE name = ':Mary'").result
+
+    assert result.dict() == {"name": (":Mary",)}
+
+
+def test_error_suggests_turning_feature_on_if_it_detects_named_params(ip):
+    ip.run_cell("%config SqlMagic.named_parameters = False")
+
+    with pytest.raises(UsageError) as excinfo:
+        ip.run_cell("%sql SELECT * FROM penguins.csv where species = :species")
+
+    suggestion = (
+        "Your query contains named parameters (species) but the named "
+        "parameters feature is disabled. Enable it with: "
+        "%config SqlMagic.named_parameters=True"
+    )
+    assert suggestion in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "cell, expected_warning",
+    [
+        (
+            "%sql SELECT * FROM author where last_name = ':last_name'",
+            "The following variables are defined: last_name.",
+        ),
+        (
+            "%sql SELECT * FROM author where last_name = ':last_name' "
+            "and first_name = :first_name",
+            "The following variables are defined: last_name.",
+        ),
+        (
+            "%sql SELECT * FROM author where last_name = ':last_name' "
+            "and first_name = ':first_name'",
+            "The following variables are defined: first_name, last_name.",
+        ),
+    ],
+    ids=[
+        "one-quoted",
+        "one-quoted-one-unquoted",
+        "two-quoted",
+    ],
+)
+def test_warning_if_variable_defined_but_named_param_is_quoted(
+    ip, cell, expected_warning
+):
+    ip.run_cell("%config SqlMagic.named_parameters = True")
+    ip.run_cell("last_name = 'Shakespeare'")
+    ip.run_cell("first_name = 'William'")
+
+    with pytest.warns(
+        JupySQLQuotedNamedParametersWarning,
+        match=expected_warning,
+    ):
+        ip.run_cell(cell)
